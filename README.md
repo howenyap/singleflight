@@ -1,5 +1,7 @@
 # singleflight
-Request deduplication for Gleam. Concurrent calls for the same key only execute once, all cals receive the same result.
+Request deduplication for Gleam.
+
+Concurrent requests for the same key are only execute once, all calls share the same result without repeated work.
 
 ## Install
 
