@@ -3,13 +3,13 @@ Request deduplication for Gleam.
 
 Concurrent requests for the same key are only execute once, all calls share the same result without repeated work.
 
-## Install
+# Install
 
 ```sh
 gleam add singleflight
 ```
 
-## Usage
+# Usage
 
 ```gleam
 import gleam/io
@@ -24,8 +24,20 @@ pub fn main() -> Nil {
   let assert Ok(actor.Started(data: server, ..)) =
     singleflight.start(config, name)
 
-  let value = singleflight.fetch(server, "key", fn(key) { key <> "-value" })
+  let value =
+    case singleflight.fetch(server, "key", fn(key) { key <> "-value" }) {
+      Ok(value) -> value
+      Error(singleflight.Crashed) -> panic as "singleflight worker crashed"
+      Error(singleflight.TimedOut) -> panic as "singleflight request timed out"
+    }
 
   io.debug(value)
 }
 ```
+
+## Errors
+`fetch` returns `Error(singleflight.Crashed)` if the singleflight actor or the
+worker process exits before producing a value.
+
+`fetch` returns `Error(singleflight.TimedOut)` if no reply arrives within
+`fetch_timeout_ms`.

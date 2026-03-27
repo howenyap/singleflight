@@ -7,9 +7,21 @@ pub type Config {
   Config(initialisation_timeout_ms: Int, fetch_timeout_ms: Int)
 }
 
+pub type FetchError {
+  Crashed
+  TimedOut
+}
+
+pub type FetchResult(v) =
+  Result(v, FetchError)
+
+type ReplySubject(v) =
+  process.Subject(FetchResult(v))
+
 pub type Message(k, v) {
-  Request(key: k, work: fn(k) -> v, caller: process.Subject(v))
-  Done(key: k, result: v)
+  Request(key: k, work: fn(k) -> v, caller: ReplySubject(v))
+  Done(pid: process.Pid, key: k, result: FetchResult(v))
+  WorkerDown(pid: process.Pid)
 }
 
 pub opaque type Singleflight(k, v) {
@@ -18,7 +30,8 @@ pub opaque type Singleflight(k, v) {
 
 type State(k, v) {
   State(
-    in_flight: dict.Dict(k, List(process.Subject(v))),
+    in_flight: dict.Dict(k, List(ReplySubject(v))),
+    workers: dict.Dict(process.Pid, k),
     self: process.Subject(Message(k, v)),
   )
 }
@@ -37,7 +50,22 @@ pub fn start(
   let Config(initialisation_timeout_ms:, fetch_timeout_ms:) = config
 
   actor.new_with_initialiser(initialisation_timeout_ms, fn(self) {
-    actor.initialised(State(in_flight: dict.new(), self: self))
+    let selector =
+      process.new_selector()
+      |> process.select(self)
+      |> process.select_monitors(fn(down) {
+        case down {
+          process.ProcessDown(pid: pid, ..) -> WorkerDown(pid: pid)
+          process.PortDown(..) -> WorkerDown(pid: process.self())
+        }
+      })
+
+    actor.initialised(State(
+      in_flight: dict.new(),
+      workers: dict.new(),
+      self: self,
+    ))
+    |> actor.selecting(selector)
     |> actor.returning(Singleflight(
       subject: self,
       fetch_timeout_ms: fetch_timeout_ms,
@@ -49,12 +77,35 @@ pub fn start(
   |> actor.start
 }
 
-pub fn fetch(singleflight: Singleflight(k, v), key: k, work: fn(k) -> v) -> v {
+pub fn fetch(
+  singleflight: Singleflight(k, v),
+  key: k,
+  work: fn(k) -> v,
+) -> FetchResult(v) {
   let Singleflight(subject:, fetch_timeout_ms:) = singleflight
 
-  actor.call(subject, fetch_timeout_ms, fn(caller) {
-    Request(key: key, work: work, caller: caller)
-  })
+  case process.subject_owner(subject) {
+    Ok(actor_pid) -> {
+      let caller = process.new_subject()
+      let monitor = process.monitor(actor_pid)
+
+      process.send(subject, Request(key: key, work: work, caller: caller))
+
+      let result =
+        process.new_selector()
+        |> process.select(caller)
+        |> process.select_specific_monitor(monitor, fn(_) { Error(Crashed) })
+        |> process.selector_receive(within: fetch_timeout_ms)
+
+      process.demonitor_process(monitor)
+
+      case result {
+        Ok(result) -> result
+        Error(Nil) -> Error(TimedOut)
+      }
+    }
+    Error(Nil) -> Error(Crashed)
+  }
 }
 
 fn handle_message(
@@ -74,27 +125,66 @@ fn handle_message(
 
         Error(Nil) -> {
           let self = state.self
-          process.spawn(fn() {
-            let result = work(key)
-            actor.send(self, Done(key: key, result: result))
-          })
+          let worker_pid =
+            process.spawn_unlinked(fn() {
+              let result = work(key)
+
+              actor.send(
+                self,
+                Done(pid: process.self(), key: key, result: Ok(result)),
+              )
+            })
+
+          process.monitor(worker_pid)
+
           actor.continue(
             State(
               ..state,
               in_flight: dict.insert(state.in_flight, key, [caller]),
+              workers: dict.insert(state.workers, worker_pid, key),
             ),
           )
         }
       }
 
-    Done(key, result) -> {
+    WorkerDown(pid) ->
+      case dict.get(state.workers, pid) {
+        Ok(key) -> {
+          case dict.get(state.in_flight, key) {
+            Ok(waiters) ->
+              list.each(waiters, fn(waiter) {
+                process.send(waiter, Error(Crashed))
+              })
+
+            Error(Nil) -> Nil
+          }
+
+          actor.continue(
+            State(
+              ..state,
+              in_flight: dict.delete(state.in_flight, key),
+              workers: dict.delete(state.workers, pid),
+            ),
+          )
+        }
+
+        Error(Nil) -> actor.continue(state)
+      }
+
+    Done(pid, key, result) -> {
       case dict.get(state.in_flight, key) {
         Ok(waiters) ->
           list.each(waiters, fn(waiter) { process.send(waiter, result) })
+
         Error(Nil) -> Nil
       }
+
       actor.continue(
-        State(..state, in_flight: dict.delete(state.in_flight, key)),
+        State(
+          ..state,
+          in_flight: dict.delete(state.in_flight, key),
+          workers: dict.delete(state.workers, pid),
+        ),
       )
     }
   }

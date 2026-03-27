@@ -39,8 +39,8 @@ pub fn same_key_deduplicates_to_one_request_test() {
 
   process.send(first_release, "release")
 
-  let assert Ok("foo") = process.receive(first_result, within: 1000)
-  let assert Ok("foo") = process.receive(second_result, within: 1000)
+  let assert Ok(Ok("foo")) = process.receive(first_result, within: 1000)
+  let assert Ok(Ok("foo")) = process.receive(second_result, within: 1000)
 
   let assert Error(Nil) = process.receive(started, within: 0)
 }
@@ -78,10 +78,26 @@ pub fn different_keys_run_two_requests_test() {
   process.send(foo_release, "release")
   process.send(bar_release, "release")
 
-  let assert Ok("foo") = process.receive(first_result, within: 1000)
-  let assert Ok("bar") = process.receive(second_result, within: 1000)
+  let assert Ok(Ok("foo")) = process.receive(first_result, within: 1000)
+  let assert Ok(Ok("bar")) = process.receive(second_result, within: 1000)
 
   let assert Error(Nil) = process.receive(started, within: 0)
+}
+
+pub fn work_crash_returns_error_and_does_not_poison_key_test() {
+  let server = start_test_server("singleflight_test_crash")
+
+  let result_subject = process.new_subject()
+
+  process.spawn(fn() {
+    let result = singleflight.fetch(server, "foo", fn(_key) { panic as "boom" })
+    process.send(result_subject, result)
+  })
+
+  let assert Ok(Error(singleflight.Crashed)) =
+    process.receive(result_subject, within: 1000)
+
+  let assert Ok("ok") = singleflight.fetch(server, "foo", fn(_key) { "ok" })
 }
 
 fn start_test_server(
