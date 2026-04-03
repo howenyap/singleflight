@@ -3,6 +3,9 @@ Request deduplication for Gleam.
 
 Concurrent requests for the same key are only execute once, all calls share the same result without repeated work.
 
+# Blog
+I wrote about how this works [here](https://howenyap.com/writings/single-flight-actors/)
+
 # Install
 
 ```sh
